@@ -32,15 +32,20 @@ program
   .option('--forward-console', '浏览器里的 console.warn / console.error 也转发到终端（检测到编程助手时默认开启）')
   .option('--no-forward-console', '浏览器里的报错不转发到终端')
   .option('--devtools-login', '借本机微信开发者工具的登录态访问微信后台：真实的 code 和手机号、服务市场、插件')
+  .option('--extension <module>', '加载开发服务器扩展（npm 包名或文件路径），可以写多次', (value, previous) => [...previous, value], [])
   // 旧名，开发服务器会提示改用 --devtools-login
   .addOption(new Option('--real-login').hideHelp())
   .action(async (projectPath, options) => {
     const { DevServer } = require('@open-wxa/wxa-runner-core');
+    const resolvedProjectPath = path.resolve(process.cwd(), projectPath);
 
     try {
+      const extensions = [];
+      for (const name of options.extension) extensions.push(await loadExtension(name, resolvedProjectPath));
       const forward = await resolveForwardConsole(options.forwardConsole);
       const server = new DevServer({
-        projectPath: path.resolve(process.cwd(), projectPath),
+        projectPath: resolvedProjectPath,
+        extensions,
         port: options.port === undefined ? undefined : parseInt(options.port, 10),
         host: options.host === true ? '0.0.0.0' : options.host,
         baseLibVersion: options.baselib,
@@ -55,6 +60,7 @@ program
       console.log('');
       console.log(chalk.green('  wxa-runner 已启动'));
       console.log(`  地址      ${chalk.cyan(url)}`);
+      server.extensionEntries.forEach(entry => console.log(`  ${bannerLabel(entry.label)}${chalk.cyan(url + entry.path)}`));
       const networkUrls = server.networkUrls;
       if (networkUrls.length === 0) {
         console.log(`  局域网    ${chalk.gray('加 --host 开放局域网访问')}`);
@@ -66,7 +72,8 @@ program
       if (server.setupFile) console.log(`  setup     ${server.setupFile}`);
       console.log('');
 
-      if (options.open) openBrowser(url);
+      // 有扩展页面时打开第一个：扩展页面通常把小程序嵌在里面
+      if (options.open) openBrowser(url + (server.extensionEntries[0]?.path ?? ''));
 
       const shutdown = () => server.close().then(() => process.exit(0));
       process.on('SIGINT', shutdown);
@@ -110,6 +117,47 @@ baselib
       process.exit(1);
     }
   });
+
+/**
+ * 加载 --extension 指定的扩展。扩展装在用户项目里，从 wxa-runner 自己的安装位置不一定找得到（如 pnpm 不提升依赖时），
+ * 所以依次从项目目录、当前目录、wxa-runner 自身查找。CommonJS 和 ES 模块都可以，
+ * 默认导出可以是扩展对象，也可以是不带参数调用后返回扩展的函数
+ */
+async function loadExtension(name, projectPath) {
+  const { createRequire } = require('module');
+  const { pathToFileURL } = require('url');
+  const request = name.startsWith('.') ? path.resolve(name) : name;
+  let resolved = null;
+  for (const base of [path.join(projectPath, 'package.json'), path.join(process.cwd(), 'package.json'), __filename]) {
+    try {
+      resolved = createRequire(base).resolve(request);
+      break;
+    } catch (error) {
+      if (error.code === 'MODULE_NOT_FOUND') continue;
+      // 装了但解析不出入口，如 exports 只给了 import 条件：按 require 的规则解析，找不到可用的入口
+      throw new Error(`扩展 ${name} 加载失败：${error.message.split('\n')[0]}。package.json 的 exports 要提供 require 或 default 条件`);
+    }
+  }
+  if (!resolved) {
+    console.error(chalk.red(`\n找不到扩展 ${name}：`), chalk.cyan(`npm i -D ${name}`));
+    process.exit(1);
+  }
+  // 用 import() 而不是 require()：Node.js 22.12 之前 require() 不能加载 ES 模块，之后也不能加载带顶层 await 的。
+  // import() 拿到的 default 对 CommonJS 是 module.exports，所以 exports.default 还要再取一层
+  const exported = (await import(pathToFileURL(resolved).href)).default;
+  const candidate = exported?.default ?? exported;
+  const extension = typeof candidate === 'function' ? candidate() : candidate;
+  if (!extension || typeof extension.name !== 'string' || typeof extension.setup !== 'function') {
+    throw new Error(`${name} 不是 wxa-runner 的扩展：默认导出要有 name 和 setup()，或是返回这样的对象的函数`);
+  }
+  return extension;
+}
+
+/** 启动信息左列的标签补到 10 列宽，与「地址      」对齐；中文字符占两列 */
+function bannerLabel(label) {
+  const width = [...label].reduce((sum, ch) => sum + (ch.charCodeAt(0) > 0xff ? 2 : 1), 0);
+  return label + ' '.repeat(Math.max(10 - width, 2));
+}
 
 /**
  * 没指定 --forward-console / --no-forward-console 时：编程助手自己启动开发服务器时只看得到终端，
