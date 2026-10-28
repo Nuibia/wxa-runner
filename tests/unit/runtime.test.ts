@@ -131,6 +131,16 @@ describe('Storage', () => {
     expect(storage.info('s3').keys).toEqual(['k']);
   });
 
+  it('getStorageInfo 按 KB 报告已用空间（每个字符算 2 字节，向上取整），上限 10MB', () => {
+    const apis = createStorageApis(new MiniProgramStorage(new MemoryStore(), 'wx1'));
+    const info = () => apis.getStorageInfoSync({}, { ...context, api: 'getStorageInfoSync' }) as Record<string, any>;
+    expect(info()).toEqual({ keys: [], currentSize: 0, limitSize: 10240 });
+
+    apis.setStorageSync({ key: 'k', data: 'x'.repeat(4096), dataType: 'String' }, { ...context, api: 'setStorageSync' });
+    // 4096 个字符是 8KB，键名和序列化附带的类型信息另占几十字节
+    expect(info()).toMatchObject({ keys: ['k'], currentSize: 9 });
+  });
+
   it('不同 appid 的数据互不可见', () => {
     const store = new MemoryStore();
     new MiniProgramStorage(store, 'a').set('s0', 'k', '1');
@@ -168,5 +178,22 @@ describe('FileStore', () => {
     fs.execute('rmdir', { dirPath: '/__wxa__/usr/s1/sub' });
     expect(fs.readdir('/__wxa__/usr/s1')).toEqual([]);
     expect(fs.readdir('/__wxa__/tmp/s1')).toEqual([]);
+  });
+
+  it('copyFile 复制内容，getFileInfo 给出字节数，unlink 删除文件但不能删目录', () => {
+    const fs = new FileStore(['/usr']);
+    fs.execute('writeFile', { filePath: '/usr/a.txt', data: '中文', encoding: 'utf8' });
+    fs.execute('copyFile', { srcPath: '/usr/a.txt', destPath: '/usr/b.txt' });
+    expect(fs.execute('readFile', { filePath: '/usr/b.txt', encoding: 'utf8' })).toEqual({ data: '中文' });
+    expect(fs.execute('getFileInfo', { filePath: '/usr/b.txt' })).toEqual({ size: 6 });
+
+    fs.execute('unlink', { filePath: '/usr/a.txt' });
+    expect(() => fs.execute('access', { path: '/usr/a.txt' })).toThrow('no such file or directory /usr/a.txt');
+    expect(fs.execute('access', { path: '/usr/b.txt' })).toEqual({});
+    expect(() => fs.execute('unlink', { filePath: '/usr' })).toThrow('operation not permitted');
+  });
+
+  it('不支持的操作报错并指出操作名', () => {
+    expect(() => new FileStore().execute('chmod', {})).toThrow('unsupported filesystem operation chmod');
   });
 });
